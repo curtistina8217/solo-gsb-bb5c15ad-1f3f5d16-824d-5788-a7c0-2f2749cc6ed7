@@ -400,6 +400,72 @@ def test_min_capacity_matches_linear_scan():
             assert [k.item_ids for k in kilns] == [k.item_ids for k in exp_kilns]
 
 
+def test_min_capacity_huge_volumes_use_subset_sum_thresholds():
+    # 大体积回归：两件同温区、体积各 10**200 的器物目标 1 窑。
+    # 旧实现按整数在 [10**200, 2*10**200] 上二分，每个容量点都完整重解，
+    # 大整数区间导致数百次完整求解；新实现只在「温区可同窑非空子集体积和」
+    # 候选阈值（10**200 与 2*10**200）上搜索，应瞬时返回 2*10**200。
+    import time
+
+    big = 10**200
+    items = [Ware("1", big, 100, 200), Ware("2", big, 100, 200)]
+
+    t0 = time.time()
+    cap, kilns = min_capacity_for_target(items, 1)
+    elapsed = time.time() - t0
+    assert elapsed < 2.0, f"大体积反查耗时 {elapsed:.2f}s，疑似退回整数二分"
+    assert cap == 2 * big
+    assert len(kilns) == 1
+    assert kilns[0].item_ids == ("1", "2")
+    assert kilns[0].total_volume == 2 * big
+    assert kilns[0].firing_temp == 100
+
+    # 目标 2 窑：最小容量为最大单件体积 10**200。
+    cap, kilns = min_capacity_for_target(items, 2)
+    assert cap == big and len(kilns) == 2
+    assert [k.item_ids for k in kilns] == [("1",), ("2",)]
+
+    # n=14 大体积、目标 1 窑同样须快速返回（旧实现 10 分钟以上仍未完成）。
+    many = [Ware(f"i{i:02d}", big, 1000, 1000) for i in range(14)]
+    t0 = time.time()
+    cap, kilns = min_capacity_for_target(many, 1)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"n=14 大体积反查耗时 {elapsed:.2f}s"
+    assert cap == 14 * big and len(kilns) == 1
+    assert kilns[0].total_volume == 14 * big
+
+
+def test_min_capacity_huge_volumes_unreachable_error():
+    # 温区不相交的两件大体积器物目标 1 窑：容量搜索不再依赖整数二分，
+    # 温区导致的不可达仍须给出明确业务错误（异常类型与消息保留）。
+    big = 10**200
+    items = [Ware("1", big, 100, 120), Ware("2", big, 130, 140)]
+    try:
+        min_capacity_for_target(items, 1)
+        assert False, "应抛出 TargetUnreachableError"
+    except TargetUnreachableError as exc:
+        assert str(2 * big) in str(exc) and "最少仍需 2 窑" in str(exc)
+    # 目标 2 窑可达，最小容量为最大单件体积。
+    cap, kilns = min_capacity_for_target(items, 2)
+    assert cap == big and len(kilns) == 2
+
+
+def test_min_capacity_threshold_is_subset_sum_not_intermediate_integer():
+    # 候选容量恰为「温区可行非空子集体积和」：体积 3/5/7、全兼容，
+    # 2 窑的拆法中容量最小者为 (3,5)=8 与 (7)，故最小容量为 8
+    # （一个子集和）；1 窑必须容纳全部器物，最小容量为总和 15。
+    items = [Ware("a", 3, 100, 200), Ware("b", 5, 100, 200), Ware("c", 7, 100, 200)]
+    cap, kilns = min_capacity_for_target(items, 2)
+    assert cap == 8 and len(kilns) == 2
+    # 返回方案与 solve(8) 的最少窑次字典序最小方案完全一致
+    assert [k.item_ids for k in kilns] == [k.item_ids for k in solve(items, 8)]
+    # 容量 7（最大单件体积，非多件子集和）装不下任何一对，仍需 3 窑，
+    # 说明最小阈值 8 确实来自子集体积和而非整数扫描的中间值
+    assert len(solve(items, 7)) == 3
+    cap, kilns = min_capacity_for_target(items, 1)
+    assert cap == 15 and len(kilns) == 1
+
+
 # ---------------------------------------------------------------------------
 # 限窑次接单 select_within_kiln_limit
 # ---------------------------------------------------------------------------

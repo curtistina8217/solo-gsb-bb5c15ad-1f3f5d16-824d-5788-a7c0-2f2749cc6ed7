@@ -22,6 +22,14 @@
 保留总体积最大 → 保留编号升序列表字典序最小」择优；选中器物的装窑
 仍调用 solve，沿用最少窑次与字典序排序。
 
+目标窑次反查最低容量（min_capacity_for_target）：容量约束只会在
+「温区可同窑的非空器物子集」的体积和处改变可行子集集合，故只做一次
+容量无关的 2^n 子集枚举，把温区可行非空子集的体积和去重升序作为候选
+阈值，在阈值上二分最小可行容量；可行性判定用大整数位 BFS
+（每层一个 2^n 位整数，移位 + popcount 位集批量扩展不相交并集），
+与容量数值大小无关，避免超大体积区间上整数二分重复完整求解。
+找到最小容量后只重建一次最少窑次且整体字典序最小的窑次明细。
+
 方案对比（compare_kiln_assignments）：以共同器物编号为范围，把来源与
 目标窑次一对一配对（配对数取两边窑次数较小值），使留在对应窑中的共同
 器物数最大。权重 w[i][j] = 来源窑 i 与目标窑 j 的共同器物数，问题即
@@ -45,6 +53,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -116,6 +125,28 @@ class CancelItemsResult:
 
 
 @dataclass(frozen=True)
+class _SubsetInfo:
+    """容量无关的子集枚举结果（位 i 对应编号升序后的第 i 件）。
+
+    temp_valid 只判定温区（与釉色互斥）可行性，与单窑容量无关；
+    容量约束只体现为子集体积和的阈值，故可在容量搜索中复用本表。
+
+    group_masks[q] / group_volumes[q] 列出温区可行、恰含 q 件器物的非空
+    子集，按体积和升序对齐排列，供容量阈值二分切片；pop_bits[r] 为
+    popcount 恰为 r 的全部器物掩码构成的大整数位集。
+    """
+
+    n: int
+    ids: list[str]
+    mask_volume: list[int]
+    mask_temp_low: list[int]  # 交集下界（烧成温度）
+    temp_valid: bytearray
+    group_masks: tuple[list[int], ...]
+    group_volumes: tuple[list[int], ...]
+    pop_bits: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class _Tables:
     """子集枚举与位掩码 DP 的中间结果（位 i 对应编号升序后的第 i 件）。"""
 
@@ -178,21 +209,17 @@ def _conflict_masks(
     return conflict
 
 
-def _build_tables(
-    items: list[Ware],
-    capacity: int,
+def _enumerate_subsets(
+    items: Sequence[Ware],
     conflict: Sequence[int] | None = None,
-) -> _Tables:
-    """枚举 2^n 个子集，递推可成窑标记、子集总体积/温度交集与最少窑次 dp。
+) -> _SubsetInfo:
+    """枚举 2^n 个子集，递推子集总体积、温度交集，标记温区可行性。
 
-    conflict 非空时，其第 i 个位掩码列出与排序后第 i 件器物互斥、不得同窑
-    的器物；该约束并入子集可行性（valid），dp 与重建逻辑完全不变。
-
-    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    可行性只含温区交集与釉色互斥（均与容量无关）：单件子集恒可行；
+    多件子集要求加入后温区仍有公共交集，且新加入器物与其余成员均不互斥。
     """
 
     n = len(items)
-    _check_item_count(n)
 
     # 器物按编号字典序升序排列；位 i 对应排序后的第 i 件。
     ordered = sorted(items, key=lambda it: it.item_id)
@@ -203,6 +230,81 @@ def _build_tables(
     if conflict is None:
         conflict = [0] * n
 
+    size = 1 << n
+
+    # 每个子集的总体积、温度交集与温区可行性（低位加一件递推）。
+    temp_valid = bytearray(size)
+    mask_volume = [0] * size
+    mask_temp_low = [0] * size   # 交集下界（烧成温度）
+    mask_temp_high = [0] * size  # 交集上界
+    temp_valid[0] = 1  # 空集视为温区可行，便于多件子集递推
+    for mask in range(1, size):
+        bit = mask & -mask  # 最低位
+        i = bit.bit_length() - 1
+        prev = mask ^ bit
+        mask_volume[mask] = mask_volume[prev] + volumes[i]
+        if prev == 0:
+            inter_low, inter_high = low[i], high[i]
+            feasible = True
+        else:
+            inter_low = max(mask_temp_low[prev], low[i])
+            inter_high = min(mask_temp_high[prev], high[i])
+            feasible = (
+                inter_low <= inter_high
+                and bool(temp_valid[prev])
+                # 新加入的第 i 件与子集 prev 内任一器物均不互斥
+                and (conflict[i] & prev) == 0
+            )
+        mask_temp_low[mask] = inter_low
+        mask_temp_high[mask] = inter_high
+        if feasible:
+            temp_valid[mask] = 1
+
+    # 温区可行非空子集按器物件数分组、组内按体积和升序（掩码次序打破并列，
+    # 保持确定性）；容量阈值二分用 bisect 切前缀即可。
+    group_masks: list[list[int]] = [[] for _ in range(n + 1)]
+    for g in range(1, size):
+        if temp_valid[g]:
+            group_masks[g.bit_count()].append(g)
+    group_volumes: list[list[int]] = [[] for _ in range(n + 1)]
+    for q, masks in enumerate(group_masks):
+        masks.sort(key=lambda g: (mask_volume[g], g))
+        group_volumes[q] = [mask_volume[g] for g in masks]
+
+    # pop_bits[r]：popcount 恰为 r 的全部器物掩码构成的大整数位集。
+    pop_bits = [0] * (n + 1)
+    for mask in range(size):
+        pop_bits[mask.bit_count()] |= 1 << mask
+
+    return _SubsetInfo(
+        n,
+        ids,
+        mask_volume,
+        mask_temp_low,
+        temp_valid,
+        tuple(group_masks),
+        tuple(group_volumes),
+        tuple(pop_bits),
+    )
+
+
+def _build_tables(
+    items: list[Ware],
+    capacity: int,
+    conflict: Sequence[int] | None = None,
+) -> _Tables:
+    """枚举 2^n 个子集并求最少窑次 dp（容量约束并入可行性标记）。
+
+    conflict 非空时，其第 i 个位掩码列出与排序后第 i 件器物互斥、不得同窑
+    的器物；该约束并入子集可行性（valid），dp 与重建逻辑完全不变。
+
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    """
+
+    n = len(items)
+    _check_item_count(n)
+
+    ordered = sorted(items, key=lambda it: it.item_id)
     oversized = [it.item_id for it in ordered if it.volume > capacity]
     if oversized:
         raise CapacityExceededError(
@@ -210,38 +312,20 @@ def _build_tables(
             + ", ".join(oversized)
         )
 
+    if conflict is None:
+        conflict = [0] * n
+    info = _enumerate_subsets(ordered, conflict)
     size = 1 << n
+    mask_volume = info.mask_volume
+    temp_valid = info.temp_valid
 
-    # ---- 1. 每个子集的总体积、温度交集与可行性（低位加一件递推） ----
+    # 容量约束只在温区可行的子集上再筛一道。
     valid = bytearray(size)
-    mask_volume = [0] * size
-    mask_temp_low = [0] * size   # 交集下界（烧成温度）
-    mask_temp_high = [0] * size  # 交集上界
     for mask in range(1, size):
-        bit = mask & -mask  # 最低位
-        i = bit.bit_length() - 1
-        prev = mask ^ bit
-        total = mask_volume[prev] + volumes[i]
-        if prev == 0:
-            inter_low, inter_high = low[i], high[i]
-            feasible = volumes[i] <= capacity
-        else:
-            inter_low = max(mask_temp_low[prev], low[i])
-            inter_high = min(mask_temp_high[prev], high[i])
-            feasible = (
-                total <= capacity
-                and inter_low <= inter_high
-                and bool(valid[prev])
-                # 新加入的第 i 件与子集 prev 内任一器物均不互斥
-                and (conflict[i] & prev) == 0
-            )
-        mask_volume[mask] = total
-        mask_temp_low[mask] = inter_low
-        mask_temp_high[mask] = inter_high
-        if feasible:
+        if temp_valid[mask] and mask_volume[mask] <= capacity:
             valid[mask] = 1
 
-    # ---- 2. 位掩码 DP：最少窑次 ----
+    # ---- 位掩码 DP：最少窑次 ----
     # dp[0] = 0；dp[mask] = 1 + min(dp[mask ^ g])，g 为 mask 的非空可行子集
     dp = [n + 1] * size
     dp[0] = 0
@@ -256,39 +340,31 @@ def _build_tables(
             sub = (sub - 1) & mask
         dp[mask] = best
 
-    return _Tables(n, ids, mask_volume, mask_temp_low, valid, dp)
+    return _Tables(
+        n,
+        info.ids,
+        mask_volume,
+        info.mask_temp_low,
+        valid,
+        dp,
+    )
 
 
-def solve(
-    items: list[Ware],
-    capacity: int,
-    separation_pairs: Sequence[Sequence[str]] | None = None,
+def _rebuild_lex_min(
+    n: int,
+    ids: Sequence[str],
+    valid: Sequence[int],
+    dp: Sequence[int],
+    mask_volume: Sequence[int],
+    mask_temp_low: Sequence[int],
 ) -> list[Kiln]:
-    """求最少窑次、字典序最小的装窑方案。
+    """贪心重建最少窑次下整体字典序最小的装窑方案。
 
-    器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
-    窑内编号升序、窑次间的整体字典序比较均以此为准。
-    separation_pairs 为釉色隔离互斥对（两端编号不同、属全部器物且不重复，
-    顺序相反视为同一对），互斥对中的两件器物不会进入同一窑；该约束并入
-    子集可行性，故最少窑次与并列时的整体字典序规则均与无互斥时一致。
-
-    :raises CapacityExceededError: 存在单件体积超过容量的器物。
-    :raises ValueError: 器物列表为空或超过 14 件，或互斥对非法。
+    每一步在剩余器物中，找到包含剩余器物最小编号、且取出后剩余部分仍可在
+    剩余窑次内装完的、器物编号序列字典序最小的子集作为下一窑。
     """
 
-    ordered = sorted(items, key=lambda it: it.item_id)
-    conflict = _conflict_masks([it.item_id for it in ordered], separation_pairs)
-    tables = _build_tables(items, capacity, conflict)
-    n = tables.n
-    ids = tables.ids
-    valid = tables.valid
-    dp = tables.dp
-    mask_volume = tables.mask_volume
-    mask_temp_low = tables.mask_temp_low
-    size = 1 << n
-
-    # ---- 3. 贪心重建字典序最小方案 ----
-    full = size - 1
+    full = (1 << n) - 1
     allowed_kilns = dp[full]
     left = full
     kilns: list[Kiln] = []
@@ -326,6 +402,38 @@ def solve(
         allowed_kilns -= 1
 
     return kilns
+
+
+def solve(
+    items: list[Ware],
+    capacity: int,
+    separation_pairs: Sequence[Sequence[str]] | None = None,
+) -> list[Kiln]:
+    """求最少窑次、字典序最小的装窑方案。
+
+    器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
+    窑内编号升序、窑次间的整体字典序比较均以此为准。
+    separation_pairs 为釉色隔离互斥对（两端编号不同、属全部器物且不重复，
+    顺序相反视为同一对），互斥对中的两件器物不会进入同一窑；该约束并入
+    子集可行性，故最少窑次与并列时的整体字典序规则均与无互斥时一致。
+
+    :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    :raises ValueError: 器物列表为空或超过 14 件，或互斥对非法。
+    """
+
+    ordered = sorted(items, key=lambda it: it.item_id)
+    conflict = _conflict_masks([it.item_id for it in ordered], separation_pairs)
+    tables = _build_tables(items, capacity, conflict)
+
+    # ---- 3. 贪心重建字典序最小方案 ----
+    return _rebuild_lex_min(
+        tables.n,
+        tables.ids,
+        tables.valid,
+        tables.dp,
+        tables.mask_volume,
+        tables.mask_temp_low,
+    )
 
 
 def select_within_kiln_limit(
@@ -403,18 +511,83 @@ def select_within_kiln_limit(
     )
 
 
+def _reach_rows(
+    info: _SubsetInfo,
+    capacity: int,
+    max_steps: int,
+) -> list[int] | None:
+    """大整数位 BFS：逐层求「恰用 k 个可成窑非空子集」可覆盖的器物掩码。
+
+    返回 rows[k]：第 k 层（恰用 k 窑）可达掩码的位集（位 mask 置 1 表示
+    掩码 mask 可由 k 个可行非空子集不相交并集构成）；一旦全集可达即提前
+    返回，此时结果只到该层，调用方不得再索引更深的层。max_steps 层后全集
+    仍不可达则返回 None。
+
+    可成窑子集在 _enumerate_subsets 中按器物件数分组、组内按体积升序，
+    故给定容量只需对各组做一次 bisect 切前缀。转移用大整数移位批量完成：
+    A 为某层可达掩码的位集，则 ``(A << g) & pop_bits[|A 掩码件数|+|g|]``
+    恰好给出与 g 不相交的并集（popcount 过滤剔除所有与 g 相交、位重叠的
+    掩码）。每次可行性判定仅做约 n^2 次大整数位运算，与容量数值大小无关
+    （体积累加只发生在一次性的 2^n 子集枚举中）。
+    """
+
+    n = info.n
+    size = 1 << n
+    pop_bits = info.pop_bits
+    group_masks = info.group_masks
+    group_volumes = info.group_volumes
+
+    # 容量切前缀：各组中体积和不超过容量的温区可行子集即可成窑。
+    # 直接记录切分终点（end[q]），避免每次查询都复制子列表。
+    end = [0] * (n + 1)
+    for q in range(1, n + 1):
+        end[q] = bisect_right(group_volumes[q], capacity)
+
+    rows = [0] * (max_steps + 1)
+    rows[0] = 1  # 仅掩码 0 可由 0 窑覆盖
+    full_bit = 1 << (size - 1)
+
+    for step in range(1, max_steps + 1):
+        layer = 0
+        prev = rows[step - 1]
+        # 恰用 step-1 个非空组覆盖的掩码至少含 step-1 件器物，
+        # 故更小的 popcount 桶必为空，直接从 pc = step-1 起枚举。
+        for pc in range(step - 1, n + 1):
+            cur = prev & pop_bits[pc]
+            if not cur:
+                continue
+            for q in range(1, n - pc + 1):
+                groups = group_masks[q]
+                eq = end[q]
+                if eq == 0:
+                    continue
+                target = pop_bits[pc + q]
+                for gi in range(eq):
+                    layer |= (cur << groups[gi]) & target
+        if not layer:
+            return None
+        rows[step] = layer
+        if layer & full_bit:
+            return rows[: step + 1]
+
+    return None
+
+
 def min_capacity_for_target(
     items: list[Ware], target_kiln_count: int
 ) -> tuple[int, list[Kiln]]:
     """求使最少窑次不超过 target_kiln_count 的最小单窑容量。
 
-    在 [最大单件体积, 器物总体积] 的整数容量范围内搜索：
-    容量不小于最大单件体积时 solve 不会抛出 CapacityExceededError，
-    容量达到总体积时体积约束名存实亡（仅剩温区规则）。
+    容量约束只会在「温区可同窑的非空器物子集」的总体积和处改变可行子集
+    集合：容量越过某子集的体积和，该子集才成为可成窑子集，故最优容量必
+    等于这些体积和之一。枚举全部温区可行非空子集（2^n 个）的体积和，
+    去重升序后作为候选阈值；窑次数随候选阈值单调不增，二分取首个可行者，
+    避免在 [最大单件体积, 总体积] 的整数区间上逐点调用完整求解器
+    （两端可能相差 10^200 量级，整数二分会重复完整求解数百次）。
 
-    窑次数随容量单调不增——容量放宽只会扩大可成窑子集集合，
-    dp 值不会变大——故二分查找最小可行容量；
-    每个容量点的判定与方案排序完全复用 solve。
+    可行性判定用大整数位 BFS（见 _reach_rows），与容量数值大小无关；
+    找到最小容量后只调用一次经典 DP + 字典序重建，返回该容量下最少窑次
+    且整体字典序最小的窑次明细。
 
     :returns: (最小容量, 该容量下最少窑次且字典序最小的装窑方案)。
     :raises TargetUnreachableError: 容量取总体积时最少窑次仍超过目标。
@@ -422,34 +595,77 @@ def min_capacity_for_target(
     """
 
     n = len(items)
-    if n == 0:
-        raise ValueError("至少需要一件器物")
-    if n > 14:
-        raise ValueError("器物数量不得超过 14 件")
+    _check_item_count(n)
     if target_kiln_count < 1:
         raise ValueError("目标窑次至少为 1")
 
-    lo = max(it.volume for it in items)
-    hi = sum(it.volume for it in items)
+    total = sum(it.volume for it in items)
 
-    # best_kilns 始终保持为 solve(items, hi) 的结果。
-    best_kilns = solve(items, hi)
-    if len(best_kilns) > target_kiln_count:
+    # 容量无关的子集表：体积和、温度交集与温区可行性只算一次，
+    # 各候选容量点与最终重建全部复用。
+    info = _enumerate_subsets(items)
+    size = 1 << n
+    mask_volume = info.mask_volume
+    temp_valid = info.temp_valid
+
+    # 容量取总体积时体积约束名存实亡（仅剩温区 / 互斥规则）；
+    # 此时仍超过目标，则目标因温区限制不可达。
+    rows = _reach_rows(info, total, target_kiln_count)
+    if rows is None:
+        full_rows = _reach_rows(info, total, n)
+        assert full_rows is not None  # 每件器物均可单独成窑
+        min_kilns = len(full_rows) - 1
         raise TargetUnreachableError(
-            f"容量取器物总体积 {hi} 时最少仍需 {len(best_kilns)} 窑，"
+            f"容量取器物总体积 {total} 时最少仍需 {min_kilns} 窑，"
             f"超过目标 {target_kiln_count} 窑，目标不可达"
         )
 
-    while lo < hi:
-        mid = (lo + hi) // 2
-        kilns = solve(items, mid)
-        if len(kilns) <= target_kiln_count:
-            hi = mid
-            best_kilns = kilns
-        else:
-            lo = mid + 1
+    # 候选阈值 = 温区可同窑非空子集的体积和，去重升序。
+    candidates = sorted({
+        mask_volume[g] for g in range(1, size) if temp_valid[g]
+    })
 
-    return lo, best_kilns
+    # 窑次数随容量单调不增——容量放宽只会扩大可成窑子集集合——
+    # 故在候选阈值上二分最小可行容量。
+    lo_idx, hi_idx = 0, len(candidates) - 1
+    while lo_idx < hi_idx:
+        mid_idx = (lo_idx + hi_idx) // 2
+        if _reach_rows(info, candidates[mid_idx], target_kiln_count) is not None:
+            hi_idx = mid_idx
+        else:
+            lo_idx = mid_idx + 1
+    min_capacity = candidates[lo_idx]
+
+    # 在最小容量下重建最少窑次且整体字典序最小的装窑明细：
+    # 可行性位集逐层累积，dp[mask] 取首个包含该掩码的层数
+    # （同一掩码可能在多个层出现，如可拆成更多窑；最早层即最少窑次），
+    # 重建规则与 solve 完全一致。
+    final_rows = _reach_rows(info, min_capacity, target_kiln_count)
+    assert final_rows is not None
+    valid = bytearray(size)
+    dp = [n + 1] * size
+    dp[0] = 0
+    for g in range(1, size):
+        if temp_valid[g] and mask_volume[g] <= min_capacity:
+            valid[g] = 1
+    for step, layer in enumerate(final_rows[1:], start=1):
+        bits = layer
+        while bits:
+            bit = bits & -bits
+            mask = bit.bit_length() - 1
+            if dp[mask] == n + 1:
+                dp[mask] = step
+            bits ^= bit
+
+    kilns = _rebuild_lex_min(
+        n,
+        info.ids,
+        valid,
+        dp,
+        mask_volume,
+        info.mask_temp_low,
+    )
+    return min_capacity, kilns
 
 
 def compare_kiln_assignments(
