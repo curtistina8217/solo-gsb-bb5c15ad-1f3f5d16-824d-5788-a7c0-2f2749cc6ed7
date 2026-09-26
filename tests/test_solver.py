@@ -367,6 +367,60 @@ def test_min_capacity_invalid_target():
         pass
 
 
+def test_min_capacity_huge_volume_candidates_not_integer_bisect():
+    # 两件同温区、体积各为 10**200：目标 1 窑时，旧的整数二分需在
+    # [10**200, 2*10**200] 上重复完整求解数百次。候选阈值只有
+    # {10**200, 2*10**200} 两个，必须快速返回且结果正确。
+    import time
+
+    big = 10**200
+    items = [Ware("a", big, 100, 200), Ware("b", big, 100, 200)]
+    t0 = time.time()
+    cap, kilns = min_capacity_for_target(items, 1)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"超大体积容量反查耗时 {elapsed:.2f}s（疑似退回整数二分）"
+    assert cap == 2 * big
+    assert len(kilns) == 1
+    assert kilns[0].item_ids == ("a", "b")
+    assert kilns[0].total_volume == 2 * big
+    assert kilns[0].firing_temp == 100
+
+    # 目标 2 窑：最低候选即单件体积
+    cap, kilns = min_capacity_for_target(items, 2)
+    assert cap == big and len(kilns) == 2
+    assert [k.item_ids for k in kilns] == [("a",), ("b",)]
+
+    # 14 件超大体积且全部温区相容：候选阈值最多 2**14-1 个，
+    # 目标 1 窑同样须在数秒内完成（旧二分约需数百次完整求解）。
+    many = [Ware(f"i{i:02d}", big, 1000 + i, 3000) for i in range(14)]
+    t0 = time.time()
+    cap, kilns = min_capacity_for_target(many, 1)
+    elapsed = time.time() - t0
+    assert elapsed < 10.0, f"14 件超大体积容量反查耗时 {elapsed:.2f}s"
+    assert cap == 14 * big and len(kilns) == 1
+
+
+def test_min_capacity_threshold_is_compatible_subset_sum():
+    # 候选阈值只取温区可同窑子集的体积和：温区不相交的两件，
+    # 即使总体积候选存在，目标 1 窑也不可达；可达目标的最小容量
+    # 不被无关子集的体积和影响。
+    items = [
+        Ware("1", 3, 100, 120),
+        Ware("2", 5, 1000, 1100),
+        Ware("3", 4, 100, 200),
+    ]
+    # 1 与 3 可同窑（体积和 7），2 温区独立 -> 最少 2 窑，
+    # 目标 2 的最小容量是 max(5, 7) = 7，而非与 2 合并的总体积 12。
+    cap, kilns = min_capacity_for_target(items, 2)
+    assert cap == 7 and len(kilns) == 2
+    assert [k.item_ids for k in kilns] == [("1", "3"), ("2",)]
+    try:
+        min_capacity_for_target(items, 1)
+        assert False, "应抛出 TargetUnreachableError"
+    except TargetUnreachableError:
+        pass
+
+
 def test_min_capacity_matches_linear_scan():
     # 随机小规模用例：与 [最大单件, 总体积] 全范围线性扫描交叉验证，
     # 同时校验返回方案与 solve 在该容量下的字典序最小方案一致
